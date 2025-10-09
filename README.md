@@ -6,12 +6,13 @@ Whether you're building a distributed scheduler, cluster coordinator, or just ne
 
 ✨ Features
 
-🗳️ Leader election via Raft consensus
+ 🗳️ Leader election via Raft consensus 
+ ⚙️ Lightweight
+ 🌐 Exposes a simple JSON HTTP API for status and coordination
+ 🔄 Automatic re-election on failure
+ 📦 Pure Go with no external dependencies
 
-⚙️ Lightweight
-
-🌐 Exposes a simple JSON HTTP API for status and coordination
-
-🔄 Automatic re-election on failure
-
-📦 Pure Go with no external dependencies
+ 🚀 Use Cases
+ Microservices needing a single active instance (e.g. cron manager, queue processor)
+ Cluster coordination or distributed lock leaders
+ Learning and experimenting with Raft elections in Go
