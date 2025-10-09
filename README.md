@@ -1,2 +1,2 @@
-# glec
+# GLEC
 Go Leader Election Component
