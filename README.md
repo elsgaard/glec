@@ -2,7 +2,7 @@
 
 **GLEC** is a lightweight, self-contained **Raft-based leader election service** written in Go. Designed for simplicity and ease of integration, GLEC allows distributed applications and microservices to reliably elect a single leader among a cluster of nodes — without the overhead of a full Raft implementation for log replication.
 
-Whether you're building a distributed scheduler, cluster coordinator, or just need fault-tolerant leader detection, **GLEC** provides the essential leader election mechanism in a minimal and modular Go package.
+Whether you're building a distributed scheduler, cluster coordinator, or just need fault-tolerant leader detection, **GLEC** provides the essential leader election mechanism.
 
 ---
 
