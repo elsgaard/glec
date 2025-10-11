@@ -2,19 +2,24 @@ package main
 
 import (
 	"flag"
-	"strings"
+	"log"
 )
 
 func main() {
-	id := flag.String("id", "localhost:8000", "Node ID (host:port)")
-	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
+	configPath := flag.String("config", "config.json", "Path to JSON config file")
 	flag.Parse()
 
-	NodeID = *id
-	if *peers != "" {
-		Peers = strings.Split(*peers, ",")
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	node := NewNode(NodeID, Peers)
+	log.Printf("Starting Raft node with ID %s and peers %v", cfg.ID, cfg.Peers)
+
+	node := NewNode(cfg.ID, cfg.Peers)
+	if node == nil {
+		log.Fatalf("Failed to initialize node for ID %s", cfg.ID)
+	}
+
 	node.Start()
 }

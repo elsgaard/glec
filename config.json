@@ -1,0 +1,4 @@
+{
+  "id": "localhost:8000",
+  "peers": ["localhost:8001", "localhost:8002"]
+}
