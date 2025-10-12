@@ -7,8 +7,6 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -27,161 +25,311 @@ const (
 	Leader    Role = "Leader"
 )
 
-type Node struct {
+// State queries and updates via channels
+type getStateReq struct {
+	resp chan NodeState
+}
+
+type updateStateReq struct {
+	fn func(*NodeState)
+}
+
+type voteReq struct {
+	candidateID string
+	term        int64
+	resp        chan bool
+}
+
+type heartbeatReq struct {
+	leader string
+	term   int64
+}
+
+type NodeState struct {
 	ID            string
 	Role          Role
 	CurrentLeader string
-	CurrentTerm   int64 // Atomic: use atomic operations
-	Peers         []string
-	mutex         sync.RWMutex
-	votedFor      string
-	votedTerm     int64
+	CurrentTerm   int64
+	VotedFor      string
+	VotedTerm     int64
+}
 
-	// Improved timer management
-	electionTimer     *time.Timer
-	electionTimerLock sync.Mutex
+type Node struct {
+	state      NodeState
+	peers      []string
+	httpClient *http.Client
 
-	// For graceful shutdown
+	// Channels for state management
+	getState    chan getStateReq
+	updateState chan updateStateReq
+	voteReq     chan voteReq
+	heartbeat   chan heartbeatReq
+
+	// Control channels
+	resetTimer    chan struct{}
+	startElection chan struct{}
+
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
-
-	// HTTP client with timeout
-	httpClient *http.Client
 }
 
 func NewNode(id string, peers []string) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Node{
-		ID:     id,
-		Role:   Follower,
-		Peers:  peers,
-		ctx:    ctx,
-		cancel: cancel,
+		state: NodeState{
+			ID:   id,
+			Role: Follower,
+		},
+		peers: peers,
 		httpClient: &http.Client{
 			Timeout: requestTimeout,
 		},
+		getState:      make(chan getStateReq),
+		updateState:   make(chan updateStateReq),
+		voteReq:       make(chan voteReq),
+		heartbeat:     make(chan heartbeatReq),
+		resetTimer:    make(chan struct{}, 1),
+		startElection: make(chan struct{}, 1),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
 func (n *Node) Start() {
-	n.resetElectionTimer()
-	n.wg.Add(1)
-	go n.runElectionTimer()
+	// Single goroutine manages all state
+	go n.stateManager()
 
+	// Election timer goroutine
+	go n.electionTimer()
+
+	// HTTP handlers
 	http.HandleFunc("/heartbeat", n.handleHeartbeat)
 	http.HandleFunc("/vote", n.handleVoteRequest)
 	http.HandleFunc("/status", n.handleStatus)
 
-	log.Println("Starting HTTP server on", n.ID)
-	go http.ListenAndServe(n.ID, nil)
+	log.Println("Starting HTTP server on", n.state.ID)
+	go http.ListenAndServe(n.state.ID, nil)
 
 	<-n.ctx.Done()
-	n.wg.Wait()
 }
 
 func (n *Node) Shutdown() {
 	n.cancel()
 }
 
-func (n *Node) resetElectionTimer() {
-	n.electionTimerLock.Lock()
-	defer n.electionTimerLock.Unlock()
-
-	timeout := time.Duration(rand.Int63n(int64(electionTimeoutMax-electionTimeoutMin))) + electionTimeoutMin
-
-	if n.electionTimer == nil {
-		n.electionTimer = time.NewTimer(timeout)
-	} else {
-		if !n.electionTimer.Stop() {
-			select {
-			case <-n.electionTimer.C:
-			default:
-			}
-		}
-		n.electionTimer.Reset(timeout)
-	}
-}
-
-func (n *Node) runElectionTimer() {
-	defer n.wg.Done()
-
+// Single goroutine that owns all state - no locks needed!
+func (n *Node) stateManager() {
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
-		case <-n.electionTimer.C:
-			n.mutex.RLock()
-			role := n.Role
-			n.mutex.RUnlock()
 
-			if role != Leader {
-				log.Println(n.ID, "Election timeout, starting election")
-				n.startElection()
-			}
-			n.resetElectionTimer()
+		case req := <-n.getState:
+			// Return a copy of state
+			req.resp <- n.state
+
+		case req := <-n.updateState:
+			// Apply update function
+			req.fn(&n.state)
+
+		case req := <-n.voteReq:
+			granted := n.handleVote(req.candidateID, req.term)
+			req.resp <- granted
+
+		case req := <-n.heartbeat:
+			n.handleHeartbeatInternal(req.leader, req.term)
+
+		case <-n.startElection:
+			go n.runElection()
 		}
 	}
 }
 
-func (n *Node) startElection() {
-	// Increment term and vote for self
-	newTerm := atomic.AddInt64(&n.CurrentTerm, 1)
+func (n *Node) handleVote(candidateID string, term int64) bool {
+	// Reject stale requests
+	if term < n.state.CurrentTerm {
+		return false
+	}
 
-	n.mutex.Lock()
-	n.Role = Candidate
-	n.votedFor = n.ID
-	n.votedTerm = newTerm
-	n.mutex.Unlock()
+	// Update term if newer
+	if term > n.state.CurrentTerm {
+		n.state.CurrentTerm = term
+		n.state.VotedFor = ""
+		n.state.VotedTerm = 0
+		n.state.Role = Follower
+	}
 
-	log.Printf("%s starting election for term %d", n.ID, newTerm)
+	// Grant vote if haven't voted in this term
+	if n.state.VotedTerm < term || n.state.VotedFor == "" || n.state.VotedFor == candidateID {
+		n.state.VotedFor = candidateID
+		n.state.VotedTerm = term
+		n.triggerTimerReset()
+		log.Printf("%s voted for %s in term %d", n.state.ID, candidateID, term)
+		return true
+	}
 
-	votes := int32(1)                       // Vote for self
-	needed := int32((len(n.Peers) + 2) / 2) // Quorum including self
+	log.Printf("%s rejected vote for %s in term %d (already voted for %s)",
+		n.state.ID, candidateID, term, n.state.VotedFor)
+	return false
+}
 
-	ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
-	defer cancel()
+func (n *Node) handleHeartbeatInternal(leader string, term int64) {
+	// Reject stale heartbeats
+	if term < n.state.CurrentTerm {
+		return
+	}
 
-	var wg sync.WaitGroup
-	for _, peer := range n.Peers {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
+	// Update term if newer
+	if term > n.state.CurrentTerm {
+		n.state.CurrentTerm = term
+	}
 
-			if n.requestVote(ctx, peer, newTerm) {
-				atomic.AddInt32(&votes, 1)
+	n.state.CurrentLeader = leader
+	n.state.Role = Follower
+
+	// Only reset votedFor if it's a new term
+	if term > n.state.VotedTerm {
+		n.state.VotedFor = ""
+		n.state.VotedTerm = 0
+	}
+
+	n.triggerTimerReset()
+}
+
+func (n *Node) electionTimer() {
+	timer := time.NewTimer(n.randomTimeout())
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			timer.Stop()
+			return
+
+		case <-n.resetTimer:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
+			timer.Reset(n.randomTimeout())
+
+		case <-timer.C:
+			// Get current state
+			req := getStateReq{resp: make(chan NodeState)}
+			select {
+			case n.getState <- req:
+				state := <-req.resp
+				if state.Role != Leader {
+					log.Println(state.ID, "Election timeout, starting election")
+					select {
+					case n.startElection <- struct{}{}:
+					default:
+					}
+				}
+			case <-n.ctx.Done():
+				return
+			}
+
+			timer.Reset(n.randomTimeout())
+		}
+	}
+}
+
+func (n *Node) randomTimeout() time.Duration {
+	return time.Duration(rand.Int63n(int64(electionTimeoutMax-electionTimeoutMin))) + electionTimeoutMin
+}
+
+func (n *Node) triggerTimerReset() {
+	select {
+	case n.resetTimer <- struct{}{}:
+	default:
+	}
+}
+
+func (n *Node) runElection() {
+	// Increment term and become candidate
+	var term int64
+	var nodeID string
+
+	update := updateStateReq{
+		fn: func(s *NodeState) {
+			s.CurrentTerm++
+			s.Role = Candidate
+			s.VotedFor = s.ID
+			s.VotedTerm = s.CurrentTerm
+			term = s.CurrentTerm
+			nodeID = s.ID
+		},
+	}
+
+	select {
+	case n.updateState <- update:
+	case <-n.ctx.Done():
+		return
+	}
+
+	log.Printf("%s starting election for term %d", nodeID, term)
+
+	// Vote for self
+	votes := 1
+	needed := (len(n.peers) + 2) / 2
+
+	// Request votes from peers
+	voteChan := make(chan bool, len(n.peers))
+
+	for _, peer := range n.peers {
+		go func(peer string) {
+			ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
+			defer cancel()
+
+			voteChan <- n.requestVote(ctx, peer, nodeID, term)
 		}(peer)
 	}
 
-	wg.Wait()
-
-	finalVotes := atomic.LoadInt32(&votes)
-	currentTerm := atomic.LoadInt64(&n.CurrentTerm)
-
-	// Check if we're still in the same term and won
-	if currentTerm == newTerm && finalVotes >= needed {
-		n.mutex.RLock()
-		stillCandidate := n.Role == Candidate
-		n.mutex.RUnlock()
-
-		if stillCandidate {
-			log.Printf("%s won election for term %d with %d votes", n.ID, newTerm, finalVotes)
-			n.becomeLeader()
+	// Collect votes
+	for i := 0; i < len(n.peers); i++ {
+		select {
+		case granted := <-voteChan:
+			if granted {
+				votes++
+			}
+		case <-n.ctx.Done():
 			return
 		}
 	}
 
-	log.Printf("%s lost election for term %d (votes: %d, needed: %d)", n.ID, newTerm, finalVotes, needed)
-	n.mutex.Lock()
-	if n.Role == Candidate && n.votedTerm == newTerm {
-		n.Role = Follower
+	// Check if won
+	req := getStateReq{resp: make(chan NodeState)}
+	select {
+	case n.getState <- req:
+		state := <-req.resp
+
+		if state.CurrentTerm == term && votes >= needed && state.Role == Candidate {
+			log.Printf("%s won election for term %d with %d votes", nodeID, term, votes)
+			n.becomeLeader(term)
+		} else {
+			log.Printf("%s lost election for term %d (votes: %d, needed: %d)", nodeID, term, votes, needed)
+			// Revert to follower if still candidate
+			update := updateStateReq{
+				fn: func(s *NodeState) {
+					if s.Role == Candidate && s.VotedTerm == term {
+						s.Role = Follower
+					}
+				},
+			}
+			select {
+			case n.updateState <- update:
+			case <-n.ctx.Done():
+			}
+		}
+	case <-n.ctx.Done():
+		return
 	}
-	n.mutex.Unlock()
 }
 
-func (n *Node) requestVote(ctx context.Context, peer string, term int64) bool {
-	url := fmt.Sprintf("http://%s/vote?id=%s&term=%d", peer, n.ID, term)
+func (n *Node) requestVote(ctx context.Context, peer string, candidateID string, term int64) bool {
+	url := fmt.Sprintf("http://%s/vote?id=%s&term=%d", peer, candidateID, term)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -197,18 +345,24 @@ func (n *Node) requestVote(ctx context.Context, peer string, term int64) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-func (n *Node) becomeLeader() {
-	n.mutex.Lock()
-	n.Role = Leader
-	n.CurrentLeader = n.ID
-	leaderTerm := atomic.LoadInt64(&n.CurrentTerm)
-	n.mutex.Unlock()
+func (n *Node) becomeLeader(term int64) {
+	update := updateStateReq{
+		fn: func(s *NodeState) {
+			s.Role = Leader
+			s.CurrentLeader = s.ID
+		},
+	}
 
-	log.Printf("%s became leader for term %d", n.ID, leaderTerm)
+	select {
+	case n.updateState <- update:
+	case <-n.ctx.Done():
+		return
+	}
 
-	n.wg.Add(1)
+	log.Printf("Node became leader for term %d", term)
+
+	// Start sending heartbeats
 	go func() {
-		defer n.wg.Done()
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 
@@ -217,27 +371,30 @@ func (n *Node) becomeLeader() {
 			case <-n.ctx.Done():
 				return
 			case <-ticker.C:
-				n.mutex.RLock()
-				stillLeader := n.Role == Leader
-				n.mutex.RUnlock()
-
-				if !stillLeader {
+				// Check if still leader
+				req := getStateReq{resp: make(chan NodeState)}
+				select {
+				case n.getState <- req:
+					state := <-req.resp
+					if state.Role != Leader {
+						return
+					}
+					n.sendHeartbeats(state.ID, term)
+				case <-n.ctx.Done():
 					return
 				}
-
-				n.sendHeartbeats(leaderTerm)
 			}
 		}
 	}()
 }
 
-func (n *Node) sendHeartbeats(term int64) {
-	for _, peer := range n.Peers {
+func (n *Node) sendHeartbeats(leaderID string, term int64) {
+	for _, peer := range n.peers {
 		go func(peer string) {
 			ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
 			defer cancel()
 
-			url := fmt.Sprintf("http://%s/heartbeat?leader=%s&term=%d", peer, n.ID, term)
+			url := fmt.Sprintf("http://%s/heartbeat?leader=%s&term=%d", peer, leaderID, term)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 			if err != nil {
 				return
@@ -259,31 +416,31 @@ func (n *Node) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var term int64
 	fmt.Sscanf(termStr, "%d", &term)
 
-	currentTerm := atomic.LoadInt64(&n.CurrentTerm)
+	req := heartbeatReq{
+		leader: leader,
+		term:   term,
+	}
 
-	// Reject stale heartbeats
-	if term < currentTerm {
-		w.WriteHeader(http.StatusConflict)
+	// Get current term to check if stale
+	getReq := getStateReq{resp: make(chan NodeState)}
+	select {
+	case n.getState <- getReq:
+		state := <-getReq.resp
+		if term < state.CurrentTerm {
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+	case <-n.ctx.Done():
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
-	// Update term if newer
-	if term > currentTerm {
-		atomic.StoreInt64(&n.CurrentTerm, term)
+	select {
+	case n.heartbeat <- req:
+		w.WriteHeader(http.StatusOK)
+	case <-n.ctx.Done():
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-
-	n.mutex.Lock()
-	n.CurrentLeader = leader
-	n.Role = Follower
-	// Only reset votedFor if it's a new term
-	if term > n.votedTerm {
-		n.votedFor = ""
-		n.votedTerm = 0
-	}
-	n.mutex.Unlock()
-
-	n.resetElectionTimer()
-	w.WriteHeader(http.StatusOK)
 }
 
 func (n *Node) handleVoteRequest(w http.ResponseWriter, r *http.Request) {
@@ -293,50 +450,42 @@ func (n *Node) handleVoteRequest(w http.ResponseWriter, r *http.Request) {
 	var term int64
 	fmt.Sscanf(termStr, "%d", &term)
 
-	currentTerm := atomic.LoadInt64(&n.CurrentTerm)
-
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
-
-	// Reject stale requests
-	if term < currentTerm {
-		w.WriteHeader(http.StatusConflict)
-		return
+	req := voteReq{
+		candidateID: candidateID,
+		term:        term,
+		resp:        make(chan bool),
 	}
 
-	// Update term if newer
-	if term > currentTerm {
-		atomic.StoreInt64(&n.CurrentTerm, term)
-		n.votedFor = ""
-		n.votedTerm = 0
-		n.Role = Follower
-	}
-
-	// Grant vote if haven't voted in this term
-	if n.votedTerm < term || n.votedFor == "" || n.votedFor == candidateID {
-		n.votedFor = candidateID
-		n.votedTerm = term
-		n.resetElectionTimer()
-		w.WriteHeader(http.StatusOK)
-		log.Printf("%s voted for %s in term %d", n.ID, candidateID, term)
-	} else {
-		w.WriteHeader(http.StatusConflict)
-		log.Printf("%s rejected vote for %s in term %d (already voted for %s)",
-			n.ID, candidateID, term, n.votedFor)
+	select {
+	case n.voteReq <- req:
+		granted := <-req.resp
+		if granted {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusConflict)
+		}
+	case <-n.ctx.Done():
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 }
 
 func (n *Node) handleStatus(w http.ResponseWriter, r *http.Request) {
-	n.mutex.RLock()
-	defer n.mutex.RUnlock()
+	req := getStateReq{resp: make(chan NodeState)}
 
-	status := map[string]interface{}{
-		"node":   n.ID,
-		"role":   string(n.Role),
-		"leader": n.CurrentLeader,
-		"term":   atomic.LoadInt64(&n.CurrentTerm),
+	select {
+	case n.getState <- req:
+		state := <-req.resp
+
+		status := map[string]interface{}{
+			"node":   state.ID,
+			"role":   string(state.Role),
+			"leader": state.CurrentLeader,
+			"term":   state.CurrentTerm,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	case <-n.ctx.Done():
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
 }
