@@ -2,12 +2,12 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
+	"os"
 	"strings"
 )
 
 func main() {
-
 	id := flag.String("id", "localhost:8000", "Node ID (host:port)")
 	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
 
@@ -18,11 +18,16 @@ func main() {
 		Peers = strings.Split(*peers, ",")
 	}
 
-	log.Printf("Starting Raft node with ID %s and peers %v", NodeID, Peers)
+	// Set up slog logger (basic text handler to stdout)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	slog.Info("Starting Raft node", "id", NodeID, "peers", Peers)
 
 	node := NewNode(NodeID, Peers)
 	if node == nil {
-		log.Fatalf("Failed to initialize node for ID %s", NodeID)
+		slog.Error("Failed to initialize node", "id", NodeID)
+		os.Exit(1)
 	}
 
 	node.Start()

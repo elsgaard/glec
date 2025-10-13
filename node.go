@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -25,7 +26,6 @@ const (
 	Leader    Role = "Leader"
 )
 
-// State queries and updates via channels
 type getStateReq struct {
 	resp chan NodeState
 }
@@ -59,13 +59,11 @@ type Node struct {
 	peers      []string
 	httpClient *http.Client
 
-	// Channels for state management
 	getState    chan getStateReq
 	updateState chan updateStateReq
 	voteReq     chan voteReq
 	heartbeat   chan heartbeatReq
 
-	// Control channels
 	resetTimer    chan struct{}
 	startElection chan struct{}
 
@@ -96,18 +94,18 @@ func NewNode(id string, peers []string) *Node {
 }
 
 func (n *Node) Start() {
-	// Single goroutine manages all state
-	go n.stateManager()
+	// Set up structured logger
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
 
-	// Election timer goroutine
+	go n.stateManager()
 	go n.electionTimer()
 
-	// HTTP handlers
 	http.HandleFunc("/heartbeat", n.handleHeartbeat)
 	http.HandleFunc("/vote", n.handleVoteRequest)
 	http.HandleFunc("/status", n.handleStatus)
 
-	log.Println("Starting HTTP server on", n.state.ID)
+	slog.Info("Starting HTTP server", "address", n.state.ID)
 	go http.ListenAndServe(n.state.ID, nil)
 
 	<-n.ctx.Done()
@@ -117,28 +115,20 @@ func (n *Node) Shutdown() {
 	n.cancel()
 }
 
-// Single goroutine that owns all state - no locks needed!
 func (n *Node) stateManager() {
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
-
 		case req := <-n.getState:
-			// Return a copy of state
 			req.resp <- n.state
-
 		case req := <-n.updateState:
-			// Apply update function
 			req.fn(&n.state)
-
 		case req := <-n.voteReq:
 			granted := n.handleVote(req.candidateID, req.term)
 			req.resp <- granted
-
 		case req := <-n.heartbeat:
 			n.handleHeartbeatInternal(req.leader, req.term)
-
 		case <-n.startElection:
 			go n.runElection()
 		}
@@ -146,12 +136,10 @@ func (n *Node) stateManager() {
 }
 
 func (n *Node) handleVote(candidateID string, term int64) bool {
-	// Reject stale requests
 	if term < n.state.CurrentTerm {
 		return false
 	}
 
-	// Update term if newer
 	if term > n.state.CurrentTerm {
 		n.state.CurrentTerm = term
 		n.state.VotedFor = ""
@@ -159,27 +147,23 @@ func (n *Node) handleVote(candidateID string, term int64) bool {
 		n.state.Role = Follower
 	}
 
-	// Grant vote if haven't voted in this term
 	if n.state.VotedTerm < term || n.state.VotedFor == "" || n.state.VotedFor == candidateID {
 		n.state.VotedFor = candidateID
 		n.state.VotedTerm = term
 		n.triggerTimerReset()
-		log.Printf("%s voted for %s in term %d", n.state.ID, candidateID, term)
+		slog.Info("Vote granted", "voter", n.state.ID, "candidate", candidateID, "term", term)
 		return true
 	}
 
-	log.Printf("%s rejected vote for %s in term %d (already voted for %s)",
-		n.state.ID, candidateID, term, n.state.VotedFor)
+	slog.Info("Vote rejected", "voter", n.state.ID, "candidate", candidateID, "term", term, "votedFor", n.state.VotedFor)
 	return false
 }
 
 func (n *Node) handleHeartbeatInternal(leader string, term int64) {
-	// Reject stale heartbeats
 	if term < n.state.CurrentTerm {
 		return
 	}
 
-	// Update term if newer
 	if term > n.state.CurrentTerm {
 		n.state.CurrentTerm = term
 	}
@@ -187,7 +171,6 @@ func (n *Node) handleHeartbeatInternal(leader string, term int64) {
 	n.state.CurrentLeader = leader
 	n.state.Role = Follower
 
-	// Only reset votedFor if it's a new term
 	if term > n.state.VotedTerm {
 		n.state.VotedFor = ""
 		n.state.VotedTerm = 0
@@ -204,7 +187,6 @@ func (n *Node) electionTimer() {
 		case <-n.ctx.Done():
 			timer.Stop()
 			return
-
 		case <-n.resetTimer:
 			if !timer.Stop() {
 				select {
@@ -213,15 +195,13 @@ func (n *Node) electionTimer() {
 				}
 			}
 			timer.Reset(n.randomTimeout())
-
 		case <-timer.C:
-			// Get current state
 			req := getStateReq{resp: make(chan NodeState)}
 			select {
 			case n.getState <- req:
 				state := <-req.resp
 				if state.Role != Leader {
-					log.Println(state.ID, "Election timeout, starting election")
+					slog.Info("Election timeout", "node", state.ID, "term", state.CurrentTerm)
 					select {
 					case n.startElection <- struct{}{}:
 					default:
@@ -230,7 +210,6 @@ func (n *Node) electionTimer() {
 			case <-n.ctx.Done():
 				return
 			}
-
 			timer.Reset(n.randomTimeout())
 		}
 	}
@@ -248,7 +227,6 @@ func (n *Node) triggerTimerReset() {
 }
 
 func (n *Node) runElection() {
-	// Increment term and become candidate
 	update := updateStateReq{
 		fn: func(s *NodeState) {
 			s.CurrentTerm++
@@ -258,14 +236,12 @@ func (n *Node) runElection() {
 		},
 	}
 
-	// Apply the state update
 	select {
 	case n.updateState <- update:
 	case <-n.ctx.Done():
 		return
 	}
 
-	// Now fetch updated state (including term and ID)
 	req := getStateReq{resp: make(chan NodeState)}
 	select {
 	case n.getState <- req:
@@ -273,25 +249,20 @@ func (n *Node) runElection() {
 		term := state.CurrentTerm
 		nodeID := state.ID
 
-		log.Printf("%s starting election for term %d", nodeID, term)
+		slog.Info("Starting election", "node", nodeID, "term", term)
 
-		// Vote for self
 		votes := 1
 		needed := (len(n.peers) + 2) / 2
-
-		// Request votes from peers
 		voteChan := make(chan bool, len(n.peers))
 
 		for _, peer := range n.peers {
 			go func(peer string) {
 				ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
 				defer cancel()
-
 				voteChan <- n.requestVote(ctx, peer, nodeID, term)
 			}(peer)
 		}
 
-		// Collect votes
 		for i := 0; i < len(n.peers); i++ {
 			select {
 			case granted := <-voteChan:
@@ -303,19 +274,15 @@ func (n *Node) runElection() {
 			}
 		}
 
-		// Check if won
 		verifyReq := getStateReq{resp: make(chan NodeState)}
 		select {
 		case n.getState <- verifyReq:
 			updatedState := <-verifyReq.resp
-
 			if updatedState.CurrentTerm == term && votes >= needed && updatedState.Role == Candidate {
-				log.Printf("%s won election for term %d with %d votes", nodeID, term, votes)
+				slog.Info("Election won", "node", nodeID, "term", term, "votes", votes)
 				n.becomeLeader(term)
 			} else {
-				log.Printf("%s lost election for term %d (votes: %d, needed: %d)", nodeID, term, votes, needed)
-
-				// Revert to follower if still candidate
+				slog.Info("Election lost", "node", nodeID, "term", term, "votes", votes, "needed", needed)
 				revert := updateStateReq{
 					fn: func(s *NodeState) {
 						if s.Role == Candidate && s.VotedTerm == term {
@@ -323,7 +290,6 @@ func (n *Node) runElection() {
 						}
 					},
 				}
-
 				select {
 				case n.updateState <- revert:
 				case <-n.ctx.Done():
@@ -332,7 +298,6 @@ func (n *Node) runElection() {
 		case <-n.ctx.Done():
 			return
 		}
-
 	case <-n.ctx.Done():
 		return
 	}
@@ -340,18 +305,15 @@ func (n *Node) runElection() {
 
 func (n *Node) requestVote(ctx context.Context, peer string, candidateID string, term int64) bool {
 	url := fmt.Sprintf("http://%s/vote?id=%s&term=%d", peer, candidateID, term)
-
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false
 	}
-
 	resp, err := n.httpClient.Do(req)
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
-
 	return resp.StatusCode == http.StatusOK
 }
 
@@ -369,9 +331,8 @@ func (n *Node) becomeLeader(term int64) {
 		return
 	}
 
-	log.Printf("Node became leader for term %d", term)
+	slog.Info("Node became leader", "node", n.state.ID, "term", term)
 
-	// Start sending heartbeats
 	go func() {
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
@@ -381,7 +342,6 @@ func (n *Node) becomeLeader(term int64) {
 			case <-n.ctx.Done():
 				return
 			case <-ticker.C:
-				// Check if still leader
 				req := getStateReq{resp: make(chan NodeState)}
 				select {
 				case n.getState <- req:
@@ -431,7 +391,6 @@ func (n *Node) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		term:   term,
 	}
 
-	// Get current term to check if stale
 	getReq := getStateReq{resp: make(chan NodeState)}
 	select {
 	case n.getState <- getReq:
