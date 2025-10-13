@@ -10,3 +10,7 @@ builds:
     id: "glec"
     dir: .
     main: ./
+archives:
+  -
+    files:
+    - config.json
