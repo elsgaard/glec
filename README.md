@@ -28,8 +28,9 @@ Whether you're building a distributed scheduler, cluster coordinator, or just ne
 ## 🌐 HTTP API
 
 GLEC exposes a **minimal JSON HTTP API** for interaction, monitoring, and integration. This allows other services or monitoring systems to query the election state or verify leadership.
+If your application or script needs to perform leader-only tasks (e.g., data sync, scheduled jobs, exclusive writes), you can use this service to check if the local instance is currently the leader.
 
-### Example Endpoints
+✅ Query the /status endpoint and proceed only if the current instance role is the leader.
 
 ```http
 GET /status
@@ -46,9 +47,8 @@ GET /status
 ### How to run
 
 ```console
-go run main.go node.go config.go -id=localhost:8000 -peers=localhost:8001,localhost:8002
-go run main.go node.go config.go -id=localhost:8001 -peers=localhost:8000,localhost:8002
-go run main.go node.go config.go -id=localhost:8002 -peers=localhost:8000,localhost:8001
+./glec -id=node-1:8000 -peers=node-2:8000,node-3:8000
 ```
+
 
 
