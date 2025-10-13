@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	id := flag.String("id", "localhost:8000", "Node ID (host:port)")
+	id := flag.String("id", "0.0.0.0:8000", "Node ID (host:port)")
 	peers := flag.String("peers", "", "Comma-separated list of peer addresses")
 
 	flag.Parse()
