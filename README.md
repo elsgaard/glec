@@ -36,8 +36,8 @@ If your application or script needs to perform leader-only tasks (e.g., data syn
 GET /status
 
 {
-  "leader": "localhost:8000",
-  "node": "localhost:8000",
+  "leader": "node-1:8000",
+  "node": "node-1:8000",
   "role": "Leader",
   "term": 1
 }
@@ -49,6 +49,7 @@ GET /status
 ```console
 ./glec -id=node-1:8000 -peers=node-2:8000,node-3:8000
 ```
+
 
 
 
