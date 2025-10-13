@@ -249,80 +249,90 @@ func (n *Node) triggerTimerReset() {
 
 func (n *Node) runElection() {
 	// Increment term and become candidate
-	var term int64
-	var nodeID string
-
 	update := updateStateReq{
 		fn: func(s *NodeState) {
 			s.CurrentTerm++
 			s.Role = Candidate
 			s.VotedFor = s.ID
 			s.VotedTerm = s.CurrentTerm
-			term = s.CurrentTerm
-			nodeID = s.ID
 		},
 	}
 
+	// Apply the state update
 	select {
 	case n.updateState <- update:
 	case <-n.ctx.Done():
 		return
 	}
 
-	log.Printf("%s starting election for term %d", nodeID, term)
-
-	// Vote for self
-	votes := 1
-	needed := (len(n.peers) + 2) / 2
-
-	// Request votes from peers
-	voteChan := make(chan bool, len(n.peers))
-
-	for _, peer := range n.peers {
-		go func(peer string) {
-			ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
-			defer cancel()
-
-			voteChan <- n.requestVote(ctx, peer, nodeID, term)
-		}(peer)
-	}
-
-	// Collect votes
-	for i := 0; i < len(n.peers); i++ {
-		select {
-		case granted := <-voteChan:
-			if granted {
-				votes++
-			}
-		case <-n.ctx.Done():
-			return
-		}
-	}
-
-	// Check if won
+	// Now fetch updated state (including term and ID)
 	req := getStateReq{resp: make(chan NodeState)}
 	select {
 	case n.getState <- req:
 		state := <-req.resp
+		term := state.CurrentTerm
+		nodeID := state.ID
 
-		if state.CurrentTerm == term && votes >= needed && state.Role == Candidate {
-			log.Printf("%s won election for term %d with %d votes", nodeID, term, votes)
-			n.becomeLeader(term)
-		} else {
-			log.Printf("%s lost election for term %d (votes: %d, needed: %d)", nodeID, term, votes, needed)
-			// Revert to follower if still candidate
-			update := updateStateReq{
-				fn: func(s *NodeState) {
-					if s.Role == Candidate && s.VotedTerm == term {
-						s.Role = Follower
-					}
-				},
-			}
+		log.Printf("%s starting election for term %d", nodeID, term)
+
+		// Vote for self
+		votes := 1
+		needed := (len(n.peers) + 2) / 2
+
+		// Request votes from peers
+		voteChan := make(chan bool, len(n.peers))
+
+		for _, peer := range n.peers {
+			go func(peer string) {
+				ctx, cancel := context.WithTimeout(n.ctx, requestTimeout)
+				defer cancel()
+
+				voteChan <- n.requestVote(ctx, peer, nodeID, term)
+			}(peer)
+		}
+
+		// Collect votes
+		for i := 0; i < len(n.peers); i++ {
 			select {
-			case n.updateState <- update:
+			case granted := <-voteChan:
+				if granted {
+					votes++
+				}
 			case <-n.ctx.Done():
+				return
 			}
 		}
+
+		// Check if won
+		verifyReq := getStateReq{resp: make(chan NodeState)}
+		select {
+		case n.getState <- verifyReq:
+			updatedState := <-verifyReq.resp
+
+			if updatedState.CurrentTerm == term && votes >= needed && updatedState.Role == Candidate {
+				log.Printf("%s won election for term %d with %d votes", nodeID, term, votes)
+				n.becomeLeader(term)
+			} else {
+				log.Printf("%s lost election for term %d (votes: %d, needed: %d)", nodeID, term, votes, needed)
+
+				// Revert to follower if still candidate
+				revert := updateStateReq{
+					fn: func(s *NodeState) {
+						if s.Role == Candidate && s.VotedTerm == term {
+							s.Role = Follower
+						}
+					},
+				}
+
+				select {
+				case n.updateState <- revert:
+				case <-n.ctx.Done():
+				}
+			}
+		case <-n.ctx.Done():
+			return
+		}
+
 	case <-n.ctx.Done():
 		return
 	}
